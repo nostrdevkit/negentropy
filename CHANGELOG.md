@@ -27,6 +27,12 @@
 
 -->
 
+## Unreleased
+
+### Fixed
+
+- Fix a frame size cut ending a sync with items missing
+
 ## 0.5.2 - 2026/10/15
 
 ### Security

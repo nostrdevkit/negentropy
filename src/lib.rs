@@ -183,6 +183,7 @@ where
         let mut prev_bound: Bound = Bound::new();
         let mut prev_index: usize = 0;
         let mut skip: bool = false;
+        let mut emitted_index: usize = 0; // items below the last bound written to full_output end here
 
         while !query.is_empty() {
             let mut o: Vec<u8> = Vec::new();
@@ -289,19 +290,25 @@ where
 
                         full_output.extend(&o);
                         o.clear();
+                        emitted_index = upper;
                     }
                 }
             }
 
             if self.exceeded_frame_size_limit(full_output.len() + o.len()) {
-                // frameSizeLimit exceeded: Stop range processing and return a fingerprint for the remaining range
-                let remaining_fingerprint = self.storage.fingerprint(upper, storage_size)?;
+                // frameSizeLimit exceeded: Stop range processing and return a fingerprint for the remaining range.
+                // The receiver reads that range as starting at the last bound written, so fingerprint from there.
+                let remaining_fingerprint =
+                    self.storage.fingerprint(emitted_index, storage_size)?;
 
                 full_output.extend(self.encode_bound(&Bound::with_timestamp(MAX_U64)));
                 full_output.extend(self.encode_mode(Mode::Fingerprint));
                 full_output.extend(remaining_fingerprint.iter());
                 break;
             } else {
+                if !o.is_empty() {
+                    emitted_index = upper;
+                }
                 full_output.extend(o);
             }
 
@@ -614,6 +621,175 @@ mod tests {
         let mut query = vec![0x61, 0x00, 0x00, 0x02, 0x02];
         query.extend(&[0xbb; ID_SIZE]);
         assert_eq!(relay.reconcile(&query), Err(Error::ParseEndsPrematurely));
+    }
+
+    // Runs a full sync between two frame-limited parties and returns every
+    // item the initiator reported as had and as needed, accumulated over all
+    // rounds.
+    fn run_frame_limited_sync(
+        initiator_storage: &NegentropyStorageVector,
+        responder_storage: &NegentropyStorageVector,
+        initiator_limit: u64,
+        responder_limit: u64,
+    ) -> (Vec<Id>, Vec<Id>) {
+        let mut initiator = Negentropy::borrowed(initiator_storage, initiator_limit).unwrap();
+        let mut responder = Negentropy::borrowed(responder_storage, responder_limit).unwrap();
+
+        let mut have_ids: Vec<Id> = Vec::new();
+        let mut need_ids: Vec<Id> = Vec::new();
+        let mut round_have: Vec<Id> = Vec::new();
+        let mut round_need: Vec<Id> = Vec::new();
+
+        let mut msg = initiator.initiate().unwrap();
+        let mut round: usize = 0;
+
+        loop {
+            round += 1;
+            assert!(round < 100, "sync did not terminate");
+
+            let response = responder.reconcile(&msg).unwrap();
+            assert!(response.len() <= responder_limit as usize);
+
+            round_have.clear();
+            round_need.clear();
+            let next = initiator
+                .reconcile_with_ids(&response, &mut round_have, &mut round_need)
+                .unwrap();
+            have_ids.extend_from_slice(&round_have);
+            need_ids.extend_from_slice(&round_need);
+
+            match next {
+                Some(output) => {
+                    assert!(output.len() <= initiator_limit as usize);
+                    msg = output;
+                }
+                None => break,
+            }
+        }
+
+        (have_ids, need_ids)
+    }
+
+    // Checks that have/need hold exactly the true differences between the two
+    // sides.
+    fn assert_full_coverage(
+        have_ids: &[Id],
+        need_ids: &[Id],
+        initiator_only: &[Id],
+        responder_only: &[Id],
+    ) {
+        for id in have_ids {
+            assert!(
+                initiator_only.contains(id),
+                "item reported as had is not an initiator-only item"
+            );
+        }
+        for id in need_ids {
+            assert!(
+                responder_only.contains(id),
+                "item reported as needed is not a responder-only item"
+            );
+        }
+        for id in initiator_only {
+            assert!(have_ids.contains(id), "item never reported as had");
+        }
+        for id in responder_only {
+            assert!(need_ids.contains(id), "item never reported as needed");
+        }
+    }
+
+    #[test]
+    fn test_frame_size_limit_cut_reports_all_differences() {
+        // A deterministic case where a frame size cut used to end the sync with
+        // items missing: the initiator's frame fills at a range where it holds
+        // nothing, so its message ends with a remaining-range fingerprint, and
+        // the responder's frame fills while splitting that range, sending the
+        // fingerprint of the empty set although it holds items there. The
+        // remaining range used to be fingerprinted from the current range's
+        // upper index instead of the last bound written to the message, so the
+        // items in between were never reported.
+        // https://github.com/nostrdevkit/negentropy/issues/15
+
+        // Mirrors the issue's reproduction: ids are a little-endian sequence
+        // number followed by zero bytes.
+        fn seq_id(seq: u64) -> Id {
+            let mut bytes = [0u8; ID_SIZE];
+            bytes[..8].copy_from_slice(&seq.to_le_bytes());
+            Id::from_byte_array(bytes)
+        }
+
+        let mut seq: u64 = 1;
+        let mut client_only: Vec<Id> = Vec::new();
+        let mut server_only: Vec<Id> = Vec::new();
+
+        let mut storage_client = NegentropyStorageVector::with_capacity(1720);
+        let mut storage_server = NegentropyStorageVector::with_capacity(1556);
+
+        // 1500 items shared by both sides.
+        for i in 0..1500 {
+            let id = seq_id(seq);
+            seq += 1;
+            storage_client.insert(1000 + i * 10, id).unwrap();
+            storage_server.insert(1000 + i * 10, id).unwrap();
+        }
+
+        // 15 items only the server holds.
+        for i in 0..15 {
+            let id = seq_id(seq);
+            seq += 1;
+            server_only.push(id);
+            storage_server.insert(1000 + i * 1000 + 5, id).unwrap();
+        }
+
+        // 70 items only the client holds, at timestamps shared between them.
+        for b in 0..2 {
+            for j in 0..35 {
+                let id = seq_id(seq);
+                seq += 1;
+                client_only.push(id);
+                storage_client
+                    .insert(1000 + b * 1000 + 201 + j % 8, id)
+                    .unwrap();
+            }
+        }
+
+        // 40 items shared by both sides.
+        for j in 0..40 {
+            let id = seq_id(seq);
+            seq += 1;
+            storage_client.insert(15900 + j * 2, id).unwrap();
+            storage_server.insert(15900 + j * 2, id).unwrap();
+        }
+
+        // One more item only the server holds.
+        let id = seq_id(seq);
+        seq += 1;
+        server_only.push(id);
+        storage_server.insert(15999, id).unwrap();
+
+        // 110 items only the client holds, above everything the server holds.
+        for i in 0..110 {
+            let id = seq_id(seq);
+            seq += 1;
+            client_only.push(id);
+            storage_client.insert(50000 + i * 10, id).unwrap();
+        }
+
+        storage_client.seal().unwrap();
+        storage_server.seal().unwrap();
+
+        // The initiator cuts frames at 4096 bytes and the responder at 4767,
+        // as in the issue's reproduction.
+        let (have_ids, need_ids) =
+            run_frame_limited_sync(&storage_client, &storage_server, 4096, 4767);
+        assert_full_coverage(&have_ids, &need_ids, &client_only, &server_only);
+
+        // The same case with the responder holding the newest items: each
+        // side's fix covers only the cuts it makes itself, so this direction
+        // must be complete too.
+        let (have_ids, need_ids) =
+            run_frame_limited_sync(&storage_server, &storage_client, 4096, 4767);
+        assert_full_coverage(&have_ids, &need_ids, &server_only, &client_only);
     }
 }
 
